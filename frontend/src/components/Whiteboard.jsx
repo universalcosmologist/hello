@@ -1,46 +1,29 @@
+import React, { useEffect, useRef, useState } from 'react';
 import rough from 'roughjs/bundled/rough.esm';
-import React,{useState,useEffect, useRef} from 'react';
+import { socket } from '../socket';
+//for shapes it is easy and also for the clear for the undo we have to think 
+//how do we add clear functionality and for undo we need to keep ops history and undo can also add back the stroke
+const gen = rough.generator();
 
-function Whiteboard() {
-  const contextRef=useRef(null);
-  const canvasRef=useRef(null);
-  const undo=useRef([]);
-  const roughCanvasRef=useRef(null);
-  useEffect(()=>{
-    const canvas=canvasRef.current;
-    contextRef.current=canvas.getContext("2d");
-    contextRef.current.font="48px serif";
-    roughCanvasRef.current=rough.canvas(canvas);
-  },[]);
-  //this ref.current is nothing but ctx
-  //const rough_canvas=rough.canvas(canvas);
-  const gen=rough.generator();
-
-  const [path,setPath]=useState([]);
-  const [points,setPoints]=useState([]);
-  const [eraser,setEraser]=useState(false);
-  const [drawing,setDrawing]=useState("");
-  const [elements,setElements]=useState([]);
-  const [shape,setShape]=useState("");//this is also to be set outside
-
-  let [action,setAction]=useState("");//set by some button outside canvas 
-
-  const find_mid_point=(p1,p2)=>{
-     return { 
-        x:p1.clientX+(p2.clientX-p1.clientX)/2,
-        y:p1.clientY+(p2.clientY-p1.clientY)/2,
-     }; 
-  }
-
-  const distance=(startx,starty,endx,endy)=>{
-        const dx=endx-startx;
-        const dy=endy-starty;
-        return Math.sqrt(dx * dx + dy * dy);
-  }
-
+const Whiteboard = ({roomId}) => {
+  const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
+  const roughCanvasRef = useRef(null);
+  const [drawing, setDrawing] = useState("");
+  const [isCanvasReady, setIsCanvasReady] = useState(false);
+  const [erase,setErase]=useState(false);
+  const [action,setAction]=useState("");
+  const [shape,setShape]=useState("");
+  let opsHistory=useRef([]);
+  const pendingOpsRef = useRef(new Map());
+  const prev_key=useRef(null);
+  const [op_map,setMap]=useState(new Map());
+ //id to what it is 
+  //here we identify every stroke with the help of its id
+  const prev=useRef(null);
   const create_element=(shape="line",startx,starty,endx,endy)=>{
       //now it can be any shape so we have to make if else ellipse is tough
-      const line_width=contextRef.current.lineWidth;
+      const line_width=ctxRef.current.lineWidth;
       if(shape=="circle"){
          //center x y then diameter
          const dx=endx-startx;
@@ -60,53 +43,144 @@ function Whiteboard() {
       }
   }
 
-  useEffect(()=>{
-    const temp=contextRef.current.lineWidth;
-    const drawPath=()=>{
-        path.forEach((line)=>{
-            //draw this line here
-            contextRef.current.beginPath();
-            let start=line[0];
-            line.forEach((point)=>{
-                let res=find_mid_point(start,point);
-                contextRef.current.lineWidth=point.line_width;
-                contextRef.current.quadraticCurveTo(
-                  res.x,
-                   res.y,
-                   point.clientX,
-                    point.clientY,
-                );
-                contextRef.current.lineTo(point.clientX,point.clientY);
-                start=point;
-                contextRef.current.stroke();
-            });
-            contextRef.current.closePath();
-            contextRef.current.save();
-        });
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    console.log(canvasRef.current);
+    canvas.width = 300;
+    canvas.height = 300;
+
+    ctxRef.current = canvas.getContext('2d');
+    roughCanvasRef.current = rough.canvas(canvas);
+    setIsCanvasReady(true);
+    const _handler=(op)=>{
+      applyop(op);
     }
-
-    if(path!=undefined && path.length>0) drawPath();
-    elements.forEach((element)=>{
-        contextRef.current.lineWidth=element.line_width;
-        roughCanvasRef.current.draw(element.ele);
-    })
-
-    contextRef.current.lineWidth=temp;
-
+    socket.on("receive_op",_handler);
     return ()=>{
-        contextRef.current.clearRect(0,0,500,300);
+      socket.off("receive_op",_handler);
     }
+  }, []);
 
-  },[path,elements]);
+  useEffect(()=>{
+    //draw the canvas from map here
+    if(isCanvasReady && roughCanvasRef && roughCanvasRef.current){
+      const canvas=canvasRef.current;
+      ctxRef.current.clearRect(0,0,canvas.width,canvas.height);
+      for (const [key, value] of op_map) {
+      const {points,shape,type}=value;
+      if(type=="shape"){
+        const res=create_element(shape,points[0][0],points[0][1],points[1][0],points[1][1]);
+        roughCanvasRef.current.draw(res.ele);
+      }else if(type=="freehand"){
+        //run for loop to print the line using moveTo and lineTo
+        ctxRef.current.beginPath();
+        ctxRef.current.moveTo(points[0][0],points[0][1]);
+        points.forEach((point)=>{
+          ctxRef.current.lineTo(point[0],point[1]);
+          ctxRef.current.stroke();
+        })
+      }
+      }
+    }
+    
+  },[op_map,isCanvasReady]);
+
+  
+  const applyop = (op) => {
+  setMap(prevMap => {
+    let newMap = new Map(prevMap);
+
+      if (op.type === "freehand" || op.type === "shape") {
+      newMap.set(op.strokeId, op);
+      opsHistory.current.push(op.strokeId);
+
+      const pending = pendingOpsRef.current.get(op.strokeId);
+      if (pending && pending.timeStamps >= op.timeStamps) {
+        newMap.delete(op.strokeId);
+        opsHistory.current=opsHistory.current.filter((t)=>t!=op.strokeId);
+        pendingOpsRef.current.delete(op.strokeId);
+        }
+      } 
+      else if (op.type === "erase") {
+      if (newMap.has(op.targetId)) {
+        const target=newMap.get(op.targetId);
+        if(op.timeStamps>=target.timeStamps){
+          newMap.delete(op.targetId);
+          opsHistory.current=opsHistory.current.filter((t)=>t!=op.targetId);
+        }
+      } 
+     
+      else {
+        pendingOpsRef.current.set(op.targetId, op);
+      }
+      }
+      else if(op.type=== "erase_all"){
+        const temp_map=new Map();
+        pendingOpsRef.current.clear();
+        newMap=temp_map;
+      }
+      else if(op.type=="undo"){
+        //remove from opsHistory and from the the map also
+        if(newMap.has(op.targetId)){
+          newMap.delete(op.targetId);
+        }
+        if(opsHistory.current.includes(op.targetId)){
+          opsHistory.current=opsHistory.current.filter((t)=>t!=op.targetId);
+        }
+      }
+      return newMap;
+    });
+  };
+
 
   const getMousePos = (event) => {
-  const rect = canvasRef.current.getBoundingClientRect(); // get canvas position
+    const rect = canvasRef.current.getBoundingClientRect(); // get canvas position
 
-  return {
-    clientX: event.clientX - rect.left,
-    clientY: event.clientY - rect.top
+    return {
+      clientX: event.clientX - rect.left,
+      clientY: event.clientY - rect.top
+    };
   };
-};
+
+  const startDrawing = (e) => {
+    const { clientX, clientY } = getMousePos(e);
+    if(action=="shape_drawing"){
+      const strokeId=`${socket.id}-${Date.now()}`;
+      const op={
+        type:"shape",
+        strokeId,
+        userId:socket.id,
+        shape,
+        timeStamps:Date.now(),
+        points:[[clientX,clientY],[clientX,clientY]],
+      }
+      prev.current=strokeId;
+      applyop(op);
+      socket.emit("operation",{op,roomId});
+      setDrawing("shape");
+    }else if(action=="erase"){
+      setErase(true);
+    }else if(action=="freehand"){
+      const strokeId=`${socket.id}-${Date.now()}`;
+      const op={
+        type:"freehand",
+        strokeId,
+        timeStamps:Date.now(),
+        points:[[clientX,clientY]],
+        userId:socket.id,
+      }
+      applyop(op);
+      socket.emit("operation",{op,roomId});
+      prev_key.current=strokeId;
+      setDrawing("freehand");
+    }
+  };
+
+   const distance=(startx,starty,endx,endy)=>{
+        const dx=endx-startx;
+        const dy=endy-starty;
+        return Math.sqrt(dx * dx + dy * dy);
+  }
 
 
   const check_line=(startx,starty,endx,endy,x,y)=>{
@@ -115,7 +189,7 @@ function Whiteboard() {
     const dist2=distance(endx,endy,x,y);
     const total_dist=distance(startx,starty,endx,endy);
     if(Math.abs(dist1+dist2-total_dist)<tolerance) return false;
-    return true;
+    return true; 
   }
 
   const check_rectangle=(startx,starty,endx,endy,x,y)=>{
@@ -161,215 +235,218 @@ function Whiteboard() {
 }
 
 
-  const check_for_erase=({clientX,clientY})=>{
-    const x=clientX;
-    const y=clientY;
-    const tolerance=3;
-    const new_elements=elements.filter((element)=>{
-        const {shape,startx,starty,endx,endy}=element;
-        if(shape=="line"){
-            return check_line(startx,starty,endx,endy,x,y);
-        }else if(shape=="rectangle"){
-            return check_rectangle(startx,starty,endx,endy,x,y);
-        }else if(shape=="circle"){
-            //check from center distance
-            return check_circle(startx,starty,endx,endy,x,y);
+  const check_erase=(x,y)=>{
+    //here check from map if found ie erase needs to be done then apply op and emit
+    //now this needs to accomodate for all 4 type of guys 
+     let is_updated=false;
+     let element_to_be_deleted=null;
+     for (const [key, value] of op_map) {
+      const {points,type}=value;
+      let res=true;
+      if(type==="shape"){
+        if(value.shape==="line"){
+          res=check_line(points[0][0],points[0][1],points[1][0],points[1][1],x,y);
+           if(!res){
+            is_updated=true;
+            element_to_be_deleted={key,value};
+            break;
+           }
+        }else if(value.shape==="rectangle"){
+          res=check_rectangle(points[0][0],points[0][1],points[1][0],points[1][1],x,y);
+               if(!res){
+                 is_updated=true;
+                 element_to_be_deleted={key,value};
+                 break;
+               }
+        }else if(value.shape==="circle"){
+           res=check_circle(points[0][0],points[0][1],points[1][0],points[1][1],x,y);
+               if(!res){
+                 is_updated=true;
+                 element_to_be_deleted={key,value};
+                 break;
+               }
         }
-    });
-    const new_path = path.filter((list) => {
-       const hit=list.some((point,i)=>{
+      }else if(type==="freehand"){
+          const tolerance=3;
+          const hit=points.some((point,i)=>{
           //if any pont found near do not take this list
-           if (i === list.length - 1) return false;
-           const next = list[i + 1];
-           return pointToSegmentDistance(x, y, point.clientX, point.clientY, next.clientX, next.clientY) < tolerance;
-       });
-       return !hit;
-    });
-    setElements(new_elements);
-    setPath(new_path);
-  }
-
-  const handleMouseDown=(e)=>{
-    const {clientX,clientY}=getMousePos(e);
-    const line_width=contextRef.current.lineWidth;
-    if(action=="freehand"){
-     setPoints([{clientX,clientY,line_width}]);
-     setDrawing("freehand");
-     contextRef.current.moveTo(clientX,clientY);
-     contextRef.current.beginPath();
-    }else if(action=="shape_drawing"){
-        const element=create_element(shape,clientX,clientY,clientX,clientY);
-        setDrawing("shape");
-        setElements((prev)=>[...prev,element]);//first point of the shape is set now
-    }else if(action=="erase"){
-        //eraser on
-        //for every point check for erase and change both arrays as per demand
-        setEraser(true);
-        check_for_erase({clientX,clientY});
-    }
-  }
-
-  const handleMouseMove=(e)=>{
-    const {clientX,clientY}=getMousePos(e);
-    const line_width=(contextRef==null) ? 1 : contextRef.current.lineWidth;
-    if(action=="freehand"){
-        if(drawing!="freehand") return;
-        const new_element={clientX,clientY,line_width};
-        const len=points.length; 
-        //give me the previous guys
-        const point=points[len-1];
-        let res=find_mid_point(point,new_element);
-        setPoints((previous)=>[...previous,new_element]);
-        contextRef.current.quadraticCurveTo(res.x,res.y,clientX,clientY);
-        contextRef.current.lineTo(clientX,clientY);//here we need to do smoothening
-        contextRef.current.stroke();
-    }else if(action=="shape_drawing"){
-        //change the last guy of the elements
-        if(drawing!="shape") return;
-        let len=elements.length-1;
-        const new_elements=[...elements];
-        const {startx,starty}=elements[len]; 
-        new_elements[len]=create_element(shape,startx,starty,clientX,clientY);//shpae,previous element,new end points
-        setElements(new_elements);
-    }else if(action=="erase"){
-        if(eraser!=true) return;
-       // console.log("hello in mouse move");
-        check_for_erase({clientX,clientY});
-    }
-  }
-
-  const handleMouseUp=(e)=>{
-    if(action=="freehand"){
-        setDrawing("");
-        contextRef.current.closePath();
-        undo.current.push("path");
-        setPath((previous)=>[...previous,points]);
-        setPoints([]);//as we have done drawing
-    }else if(action=="shape_drawing"){
-        //here add later correction ie adjust for consistency
-        undo.current.push("elements");
-        setDrawing("");
-    }else if(action=="erase"){
-        setEraser(false);
-    }
-  }
-
-  const handleReverse=()=>{
-    //this takes us one step back and remvoes the most current drawn figure from canvas
-    //push in stack and as we remove from stack(pop) delete either from path or from element
-    if(undo.current.length>0){
-       const temp=undo.current[undo.current.length-1];
-       undo.current.pop();
-      if(temp=="path"){
-        const new_path=[...path];
-        new_path.pop();
-        setPath(new_path);
-      }else if(temp=="elements"){
-        const _elements=[...elements]; 
-        _elements.pop();
-        setElements(_elements);
+           if (i === points.length - 1) return false;
+           const next = points[i + 1];
+           return pointToSegmentDistance(x, y, point[0], point[1], next[0], next[1]) < tolerance;
+          });
+          if(hit){
+            is_updated=true;
+            element_to_be_deleted={key,value};
+            break;
+          }
       }
-    }
+     }
+     if(is_updated){
+      let new_op={
+        type:"erase",
+        targetId:element_to_be_deleted.key,
+        timeStamps:Date.now(),
+        userId:socket.id,
+      }
+      applyop(new_op);
+       socket.emit("operation",{
+        op:new_op,
+        roomId,
+      });
+     }
   }
 
-  const handleDownload=()=>{
-    const canvas=canvasRef.current;
-    const url=canvas.toDataURL('image/png');
-    const element=document.createElement('a');
-    element.href=url;
-    element.download='canvas_snapshot.png';
-    element.click();
+  const draw = (e) => {
+    const { clientX, clientY } = getMousePos(e);
+    if (action=="shape_drawing"){
+    if(drawing!="shape") return;
+    const {points}=op_map.get(prev.current);
+    let x1=points[0][0],y1=points[0][1];
+    let op={
+      type:"erase",
+      targetId:prev.current,
+      timeStamps:Date.now(),
+      userId:socket.id,
+    }
+    applyop(op);
+    socket.emit("operation",{op,roomId});
+    const strokeId=`${socket.id}-${Date.now()}`;
+    let new_op={
+      type:"shape",
+      strokeId,
+      shape,
+      timeStamps:Date.now(),
+      userId:socket.id,
+      points:[[x1,y1],[clientX,clientY]]
+    }
+    applyop(new_op);
+     socket.emit("operation",{
+        op:new_op,
+        roomId,
+      });
+    prev.current=strokeId;
+
+    }else if(action=="erase"){
+      if(!erase) return;
+      check_erase(clientX,clientY);
+    }else if(action=="freehand"){
+      if(drawing!="freehand") return;
+      const {points}=op_map.get(prev_key.current);
+      const new_points=[...points,[clientX,clientY]];
+      const op={
+        type:"erase",
+        targetId:prev_key.current,
+        timeStamps:Date.now(),
+        userId:socket.id,
+      }
+      applyop(op);
+      socket.emit("operation",{op,roomId});
+      const strokeId=`${socket.id}-${Date.now()}`;
+      const new_op={
+        type:"freehand",
+        strokeId,
+        userId:socket.id,
+        points:new_points,
+        timeStamps:Date.now(),
+      }
+      applyop(new_op);
+      socket.emit("operation",{
+        op:new_op,
+        roomId,
+      });
+      prev_key.current=strokeId;
+    }
+  };
+
+  const finishDrawing = () => {
+    if(action=="shape_drawing") setDrawing("");
+    else if(action=="erase") setErase(false);
+    else if(action=="freehand") setDrawing("");
+  };
+
+  const erase_handler=()=>{
+    let temp_op={
+      type:"erase_all",
+      userId:socket.id,
+      timeStamps:Date.now(),
+    }
+    applyop(temp_op);
+    socket.emit("operation",{
+      op:temp_op,
+      roomId,
+    });
+  }
+
+  const reverse_handler=()=>{
+    if(opsHistory.current.length>0){
+      const len=opsHistory.current.length;
+      const op={
+        type:"undo",
+        targetId:opsHistory.current[len-1],
+        timeStamps:Date.now(),
+        userId:socket.id,
+      }
+      applyop(op);
+      socket.emit("operation",{op,roomId});
+    }
   }
 
   return (
-   <>
-     <div className='m-0 p-0'>
-         <canvas
-      id="canvas"
+  <>
+      <canvas
       ref={canvasRef}
-      width={500}
-      height={300}
-      style={{ border: '1px solid #000', margin: '0px' , padding: '0px'}}
-      onMouseDown={handleMouseDown}
-      onMouseUp={handleMouseUp}
-      onMouseMove={handleMouseMove}
+      style={{ border: '1px solid black' }}
+      onMouseDown={startDrawing}
+      onMouseMove={draw}
+      onMouseUp={finishDrawing}
     >
-        Canvas
+      Canvas not supported
     </canvas>
-     </div>
-        <div style={{ marginTop: '10px' }}>
-  <p>Choose a shape:</p>
-  <button onClick={() => {
-    setShape('line');
-    setAction('shape_drawing');
-  }}>
-    Line
-  </button>
-
-  <button onClick={() => {
-    setShape('circle');
-    setAction('shape_drawing');
-  }}>
-    Circle
-  </button>
-
-  <button onClick={() => {
-    setShape('rectangle');
-    setAction('shape_drawing');
-  }}>
-    Rectangle
-  </button>
-
-  <button onClick={() => setAction('freehand')}>Freehand</button>
-  <button onClick={() => setAction('erase')}>Erase</button>
-
-  <p>Current shape: {shape || 'None'} | Mode: {action || "None"}</p>
-</div>
-<div>
     <button
-     onClick={()=>{
-        //increase the stroke width here
-        const temp=contextRef.current.lineWidth;
-        if(temp==100) return;
-        contextRef.current.lineWidth=temp+1;
-        console.log(contextRef.current.lineWidth);
-     }}
-    >
-        increase stroke width
-    </button>
-    <button 
-      onClick={()=>{ 
-        //decrease the stroke width here
-        const temp=contextRef.current.lineWidth;
-        if(temp==1) return;
-        contextRef.current.lineWidth=temp-1;
-        console.log(contextRef.current.lineWidth)
-     }}
-    >
-        decrease stroke width
-    </button>
-</div>
-   <div style={{marginTop:'15px'}}>
+     onClick={()=>setAction("erase")}
+    >Eraser</button>
     <button
     onClick={()=>{
-      setElements([]);
-      setPoints([]);
-      setPath([]);
-      undo.current=[];
+      setAction("shape_drawing")
+      setShape("line")
     }}>
-      Refresh
+      Line
     </button>
     <button
-    onClick={handleReverse}>
-      Back
+    onClick={()=>{
+      setAction("freehand");
+    }}
+    >
+     Freehand
     </button>
     <button
-    onClick={handleDownload}>
-      Download
+    onClick={()=>{
+      setAction("shape_drawing");
+      setShape("rectangle");
+    }}
+    >
+     Rectangle
     </button>
-   </div>
-   </>
-  )
-}
+    <button
+    onClick={()=>{
+      setAction("shape_drawing");
+      setShape("circle");
+    }}
+    >
+     Circle
+    </button>
+    <button 
+    onClick={erase_handler}
+    >
+      clear canvas
+    </button>
+    <button
+    onClick={reverse_handler}>
+      Reverse
+    </button>
+  </>
+  );
+};
 
-export default Whiteboard
+export default Whiteboard;
+ 

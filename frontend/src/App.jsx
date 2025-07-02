@@ -2,6 +2,7 @@ import React,{useEffect} from "react"
 import {BrowserRouter as Router , Route,Routes} from 'react-router-dom'
 import RoomPage from "./pages/RoomPage";
 import Homepage from "./pages/Homepage";
+import {RoomProvider} from './Context/RoomContext'
 import { socket } from "./socket";
 
 function App() {
@@ -29,12 +30,14 @@ function App() {
   },[]);
 
   return (
-    <Router>
+   <RoomProvider>
+     <Router>
       <Routes>
         <Route path="/" element={<Homepage isConnected={isConnected}/>}/>
         <Route path="/room/:roomId" element={<RoomPage/>}/>
       </Routes>
     </Router>
+   </RoomProvider>
   )
 }
 

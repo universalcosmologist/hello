@@ -11,8 +11,6 @@ const io=new Server(server,{
   }
 });
 
-const rooms=[];
-
 app.use(cors({
     origin:'http://localhost:5173',
 }))
@@ -22,13 +20,8 @@ app.get('/',(req,res)=>{
 })
 
 app.get('/room/:roomId',(req,res)=>{
-   const roomId=req.params.roomId;
-   if(!rooms.includes(roomId)){
-    rooms.push(roomId);
-   }
-   return res.status(200).json({success:"room joined"});
-
-});
+   return res.status(200).json({message:"room joined via express"});
+})
 
 io.on('connection',(socket)=>{
     console.log("a user connected");
@@ -38,8 +31,16 @@ io.on('connection',(socket)=>{
     });
 
     socket.on("leave-rooom",(roomId)=>{
-
+      socket.leave(roomId);
+      console.log(`user left the room : ${socket.id}`);
+      socket.to(roomId).emit("onjoin",`socket ${socket.id} left the room`);
     });
+
+    socket.on("operation",({op,roomId})=>{
+       if(socket.rooms.has(roomId)){
+        if(op) socket.to(roomId).emit("receive_op",op);
+       }
+    })
 })
 
 server.listen(8000,()=>{
